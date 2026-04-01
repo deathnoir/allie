@@ -132,7 +132,11 @@ socket.onMessage((msg) => {
       transition("thinking");
       statusEl.textContent = "working...";
     } else if (state === "idle") {
-      transition("idle");
+      // Only transition to idle if we're not still playing audio.
+      // The audioPlayer.onFinished callback handles the speaking → idle transition.
+      if (currentState !== "speaking") {
+        transition("idle");
+      }
     }
   } else if (type === "text") {
     // Text fallback when TTS fails

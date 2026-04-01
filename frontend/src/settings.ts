@@ -118,9 +118,9 @@ function buildPanelHTML(): string {
           <h3>Connection Status</h3>
           <div class="status-grid">
             <div class="status-row"><span class="status-dot" id="status-claude-cli"></span><span>Claude Code CLI</span></div>
-            <div class="status-row"><span class="status-dot" id="status-calendar"></span><span>Apple Calendar</span></div>
-            <div class="status-row"><span class="status-dot" id="status-mail"></span><span>Apple Mail</span></div>
-            <div class="status-row"><span class="status-dot" id="status-notes"></span><span>Apple Notes</span></div>
+            <div class="status-row"><span class="status-dot" id="status-calendar"></span><span>Calendar</span></div>
+            <div class="status-row"><span class="status-dot" id="status-mail"></span><span>Email</span></div>
+            <div class="status-row"><span class="status-dot" id="status-notes"></span><span>Notes</span></div>
             <div class="status-row"><span class="status-dot" id="status-server"></span><span>Server</span><span class="status-detail" id="status-server-detail"></span></div>
           </div>
         </section>

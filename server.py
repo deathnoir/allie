@@ -39,17 +39,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal
+from jarvis_platform import (
+    execute_action, monitor_build, open_terminal, open_browser,
+    open_claude_in_project, _generate_project_name, prompt_existing_terminal,
+    focus_terminal_window, open_file_explorer,
+    get_active_windows, take_screenshot, describe_screen, format_windows_for_context,
+    get_todays_events, get_upcoming_events, get_next_event,
+    format_events_for_context, format_schedule_summary, refresh_calendar_cache,
+    get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message,
+    format_unread_summary, format_messages_for_context, format_messages_for_voice,
+    get_recent_notes, read_note,
+)
+from jarvis_platform import search_notes as search_notes_apple
+from jarvis_platform import create_note as create_apple_note
+from jarvis_platform import get_mail_accounts as get_accounts
 from work_mode import WorkSession, is_casual_question
-from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
-from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
-from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, get_important_memories,
 )
-from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 
@@ -67,7 +76,27 @@ FISH_API_URL = "https://api.fish.audio/v1/tts"
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DESKTOP_PATH = Path.home() / "Desktop"
+def _find_desktop_path() -> Path:
+    """Find the actual Desktop path, handling OneDrive redirection on Windows."""
+    import sys
+    if sys.platform == "win32":
+        # Windows: check OneDrive Desktop first, then standard
+        for candidate in [
+            Path.home() / "OneDrive" / "Desktop",
+            Path.home() / "Desktop",
+        ]:
+            if candidate.exists():
+                return candidate
+    return Path.home() / "Desktop"
+
+DESKTOP_PATH = _find_desktop_path()
+
+# Additional project directories to scan (comma-separated paths in env var)
+# e.g. PROJECT_DIRS=D:\Projects,C:\Users\me\repos
+_project_dirs_env = os.getenv("PROJECT_DIRS", "")
+EXTRA_PROJECT_DIRS: list[Path] = [
+    Path(p.strip()) for p in _project_dirs_env.split(",") if p.strip()
+]
 
 JARVIS_SYSTEM_PROMPT = """\
 You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
@@ -391,21 +420,10 @@ class ClaudeTaskManager:
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
         prompt_file.write_text(task.prompt)
 
-        # Open Terminal.app with claude running in the project directory
-        applescript = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "cd {work_dir} && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
-        end tell
-        '''
-
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await process.communicate()
-        task.pid = process.pid
+        # Open terminal with claude running in the project directory
+        command = f"cd '{work_dir}' && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '--- JARVIS TASK COMPLETE ---'"
+        result = await open_terminal(command)
+        task.pid = 0  # PID tracking not available through platform abstraction
 
         # Monitor the output file for completion
         output_file = Path(work_dir) / ".jarvis_output.txt"
@@ -564,35 +582,56 @@ class ClaudeTaskManager:
 # ---------------------------------------------------------------------------
 
 async def scan_projects() -> list[dict]:
-    """Quick scan of ~/Desktop for git repos (depth 1)."""
+    """Scan Desktop and PROJECT_DIRS for git repos.
+
+    Desktop is scanned one level deep (subdirectories with .git).
+    PROJECT_DIRS entries are checked both as repos themselves AND one level deep.
+    """
     projects = []
-    desktop = DESKTOP_PATH
+    seen = set()
 
-    if not desktop.exists():
-        return projects
+    def _add_project(entry: Path):
+        entry_str = str(entry.resolve())
+        if entry_str in seen:
+            return
+        seen.add(entry_str)
 
-    try:
-        for entry in sorted(desktop.iterdir()):
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
-            git_dir = entry / ".git"
-            if git_dir.exists():
-                branch = "unknown"
-                head_file = git_dir / "HEAD"
-                try:
-                    head_content = head_file.read_text().strip()
-                    if head_content.startswith("ref: refs/heads/"):
-                        branch = head_content.replace("ref: refs/heads/", "")
-                except Exception:
-                    pass
+        git_dir = entry / ".git"
+        if not git_dir.exists():
+            return
 
-                projects.append({
-                    "name": entry.name,
-                    "path": str(entry),
-                    "branch": branch,
-                })
-    except PermissionError:
-        pass
+        branch = "unknown"
+        head_file = git_dir / "HEAD"
+        try:
+            head_content = head_file.read_text().strip()
+            if head_content.startswith("ref: refs/heads/"):
+                branch = head_content.replace("ref: refs/heads/", "")
+        except Exception:
+            pass
+
+        projects.append({
+            "name": entry.name,
+            "path": str(entry),
+            "branch": branch,
+        })
+
+    scan_dirs = [DESKTOP_PATH] + EXTRA_PROJECT_DIRS
+
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            continue
+
+        # Check if the directory itself is a git repo
+        _add_project(scan_dir)
+
+        # Also scan one level deep for sub-projects
+        try:
+            for entry in sorted(scan_dir.iterdir()):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                _add_project(entry)
+        except PermissionError:
+            pass
 
     return projects
 
@@ -843,28 +882,8 @@ async def _execute_research(target: str, ws=None):
 
 
 async def _focus_terminal_window(project_name: str):
-    """Bring a Terminal window matching the project name to front."""
-    escaped = project_name.replace('"', '\\"')
-    script = f'''
-tell application "Terminal"
-    repeat with w in windows
-        if name of w contains "{escaped}" then
-            set index of w to 1
-            activate
-            exit repeat
-        end if
-    end repeat
-end tell
-'''
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=5)
-    except Exception:
-        pass
+    """Bring a terminal window matching the project name to front."""
+    await focus_terminal_window(project_name)
 
 
 async def _execute_open_terminal():
@@ -876,14 +895,21 @@ async def _execute_open_terminal():
 
 
 def _find_project_dir(project_name: str) -> str | None:
-    """Find a project directory by name from cached projects or Desktop."""
+    """Find a project directory by name from cached projects or all scan dirs."""
+    # Check cached projects first
     for p in cached_projects:
         if project_name.lower() in p.get("name", "").lower():
             return p.get("path")
-    desktop = Path.home() / "Desktop"
-    for d in desktop.iterdir():
-        if d.is_dir() and project_name.lower() in d.name.lower():
-            return str(d)
+    # Fall back to scanning all configured directories
+    for scan_dir in [DESKTOP_PATH] + EXTRA_PROJECT_DIRS:
+        if not scan_dir.exists():
+            continue
+        try:
+            for d in scan_dir.iterdir():
+                if d.is_dir() and project_name.lower() in d.name.lower():
+                    return str(d)
+        except (PermissionError, OSError):
+            continue
     return None
 
 
@@ -1269,47 +1295,16 @@ def _refresh_context_sync():
     def _worker():
         while True:
             try:
-                # Screen — fast
+                # Screen — fast (uses platform-specific implementation)
                 try:
-                    proc = __import__("subprocess").run(
-                        ["osascript", "-e", '''
-set windowList to ""
-tell application "System Events"
-    set frontApp to name of first application process whose frontmost is true
-    set visibleApps to every application process whose visible is true
-    repeat with proc in visibleApps
-        set appName to name of proc
-        try
-            set winCount to count of windows of proc
-            if winCount > 0 then
-                repeat with w in (windows of proc)
-                    try
-                        set winTitle to name of w
-                        if winTitle is not "" and winTitle is not missing value then
-                            set windowList to windowList & appName & "|||" & winTitle & "|||" & (appName = frontApp) & linefeed
-                        end if
-                    end try
-                end repeat
-            end if
-        end try
-    end repeat
-end tell
-return windowList
-'''],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        windows = []
-                        for line in proc.stdout.strip().split("\n"):
-                            parts = line.strip().split("|||")
-                            if len(parts) >= 3:
-                                windows.append({
-                                    "app": parts[0].strip(),
-                                    "title": parts[1].strip(),
-                                    "frontmost": parts[2].strip().lower() == "true",
-                                })
+                    import asyncio as _aio
+                    _loop = _aio.new_event_loop()
+                    try:
+                        windows = _loop.run_until_complete(get_active_windows())
                         if windows:
                             _ctx_cache["screen"] = format_windows_for_context(windows)
+                    finally:
+                        _loop.close()
                 except Exception:
                     pass
 
@@ -1437,16 +1432,13 @@ async def api_list_projects():
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
-    """Synchronous Desktop scan — runs in executor."""
-    projects = []
-    desktop = Path.home() / "Desktop"
+    """Synchronous project scan — runs in executor."""
+    import asyncio
+    loop = asyncio.new_event_loop()
     try:
-        for entry in desktop.iterdir():
-            if entry.is_dir() and not entry.name.startswith("."):
-                projects.append({"name": entry.name, "path": str(entry), "branch": ""})
-    except Exception:
-        pass
-    return projects
+        return loop.run_until_complete(scan_projects())
+    finally:
+        loop.close()
 
 
 def detect_action_fast(text: str) -> dict | None:
@@ -1539,17 +1531,8 @@ async def handle_build(target: str) -> str:
     prompt_file = Path(path) / ".jarvis_prompt.txt"
     prompt_file.write_text(target)
 
-    script = (
-        'tell application "Terminal"\n'
-        "    activate\n"
-        f'    do script "cd {path} && cat .jarvis_prompt.txt | claude -p --dangerously-skip-permissions"\n'
-        "end tell"
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    command = f"cd '{path}' && cat .jarvis_prompt.txt | claude -p --dangerously-skip-permissions"
+    await open_terminal(command)
 
     recently_built.append({"name": name, "path": path, "time": time.time()})
     return f"On it, sir. Claude Code is working in {name}."
@@ -1574,10 +1557,9 @@ async def handle_show_recent() -> str:
         await open_browser(f"file://{html_files[0]}")
         return f"Opened {html_files[0].name} from {last['name']}, sir."
 
-    # Fall back to opening the folder in Finder
-    script = f'tell application "Finder"\nactivate\nopen POSIX file "{last["path"]}"\nend tell'
-    await asyncio.create_subprocess_exec("osascript", "-e", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    return f"Opened the {last['name']} folder in Finder, sir."
+    # Fall back to opening the folder in file explorer
+    await open_file_explorer(last["path"])
+    return f"Opened the {last['name']} folder, sir."
 
 
 # ---------------------------------------------------------------------------
@@ -2522,19 +2504,9 @@ async def api_restart():
 async def api_fix_self():
     """Enter work mode in the JARVIS repo — JARVIS can now fix himself."""
     jarvis_dir = str(Path(__file__).parent)
-    # The work_session is per-WebSocket, so we set a flag that the handler picks up
-    # For now, also open Terminal so user can see
-    script = (
-        'tell application "Terminal"\n'
-        '    activate\n'
-        f'    do script "cd {jarvis_dir} && claude --dangerously-skip-permissions"\n'
-        'end tell'
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    # Open terminal with Claude Code in the JARVIS repo
+    command = f"cd '{jarvis_dir}' && claude --dangerously-skip-permissions"
+    await open_terminal(command)
     log.info("Work mode: JARVIS repo opened for self-improvement")
     return {"status": "work_mode_active", "path": jarvis_dir}
 

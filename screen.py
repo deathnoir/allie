@@ -155,9 +155,13 @@ async def describe_screen(anthropic_client) -> str:
     """Describe what's on the user's screen.
 
     Tries screenshot + vision first. Falls back to window list + LLM summary.
+    Uses platform-abstracted screen functions.
     """
+    # Import platform-specific implementations
+    import jarvis_platform as _platform
+
     # Try screenshot + vision
-    screenshot_b64 = await take_screenshot()
+    screenshot_b64 = await _platform.take_screenshot()
     if screenshot_b64 and anthropic_client:
         try:
             response = await anthropic_client.messages.create(
@@ -193,8 +197,8 @@ async def describe_screen(anthropic_client) -> str:
             log.warning(f"Vision call failed, falling back to window list: {e}")
 
     # Fallback: get window list and have LLM summarize
-    windows = await get_active_windows()
-    apps = await get_running_apps()
+    windows = await _platform.get_active_windows()
+    apps = await _platform.get_running_apps()
 
     if not windows and not apps:
         return "I wasn't able to see your screen, sir. Screen recording permission may be needed."
